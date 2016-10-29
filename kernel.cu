@@ -4,6 +4,7 @@
 #include<gl/glut.h>
 #include<glm/glm.hpp>
 #include <thrust/device_vector.h>
+#include <vector>
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -36,11 +37,23 @@ struct ray{
 };
 glm::vec3 traceRay(ray r  , vec3* vertices , ivec4* faces , int numOfFaces, int depth );
 
+
+struct rayCarryForward{
+__device__
+	rayCarryForward():pixcleOffset(0) , rayType(0){}
+	rayCarryForward(ray r , int p ,bool act = 0):carryRay(r), pixcleOffset(p) , rayType(act){}
+
+
+ray carryRay;
+int pixcleOffset;
+int rayType; //1 for reflection 0 for no carry forward --use enum later 
+}carryForward;
 enum materialType{
 
 Matte  = 0,
 Specular ,
-Mirror
+Mirror,
+refract
 
 
 };
@@ -176,20 +189,44 @@ __device__ bool checkShadow(ray shadowRay ,  vec3* vertices , ivec4* faces , int
 }
 
 
-__device__ vec3 shaderSurface(rayIntersection curIntersection, vec3* vertices , ivec4* faces , int numOfFaces , int depth ){
+__device__ vec3 shaderSurface(rayIntersection curIntersection, vec3* vertices , ivec4* faces , int numOfFaces , int depth  , rayCarryForward& rayCarry ){
 
 	
 	vec3 lightPos = vec3(10 , 10 , 10);
 	vec3 lightDir = normalize(lightPos - curIntersection.point);
 	vec3 color = vec3(0);
 	ray shadowRay = ray(curIntersection.point + vec3(.01) , lightDir);
-
-	if(checkShadow( shadowRay ,   vertices ,  faces ,  numOfFaces))
+	bool shadow = checkShadow( shadowRay ,   vertices ,  faces ,  numOfFaces);
+	//shadow = true;
+	if(shadow)
 	{
 		if(curIntersection.mat == materialType::Mirror){
-			ray reflectedRay = ray(curIntersection.point + vec3(.01)  , glm::reflect(normalize(curIntersection.intersectingRay.direction) , curIntersection.normal));
+			vec3 reflDir = glm::reflect(normalize(-curIntersection.intersectingRay.direction) ,normalize( curIntersection.normal));
+			ray reflectedRay = ray(curIntersection.point +  reflDir *.1f  , reflDir);
 		//	color += traceRay(  reflectedRay , vertices ,  faces ,  numOfFaces , --depth);
-		color +=  vec3(1 , 1 , 1);
+		//color +=  vec3(1 , 1 , 1);
+		rayCarry.carryRay = reflectedRay;
+		rayCarry.rayType = 1;
+		}else if(curIntersection.mat == materialType::refract){
+			float dt = dot(normalize(-curIntersection.intersectingRay.direction) ,normalize( curIntersection.normal));
+			float refractiveID = .7;//hardcode
+			float n;
+			vec3 outNormal;
+			if(dt > 0){
+			 outNormal = normalize( -curIntersection.normal) ;
+			 n = refractiveID;
+			}else{
+			
+				outNormal = normalize( curIntersection.normal) ;
+				n = 1/refractiveID;
+			}
+			vec3 refrDir = glm::refract( normalize(-curIntersection.intersectingRay.direction) , outNormal, n);
+			ray refractedRay = ray(curIntersection.point +  refrDir *.1f  , refrDir);
+		//	color += traceRay(  reflectedRay , vertices ,  faces ,  numOfFaces , --depth);
+		//color +=  vec3(1 , 1 , 1);
+		rayCarry.carryRay = refractedRay;
+		rayCarry.rayType = 2;
+
 		}
 		else{
 	float kd = max(0.0f , dot(curIntersection.normal , lightDir));
@@ -201,10 +238,10 @@ __device__ vec3 shaderSurface(rayIntersection curIntersection, vec3* vertices , 
 }
 
 __device__
-glm::vec3 traceRay(ray r  , vec3* vertices , ivec4* faces , int numOfFaces, int depth ){
+glm::vec3 traceRay(ray r  , vec3* vertices , ivec4* faces , int numOfFaces, int depth  , rayCarryForward& carryRay){
 	
-	if(depth == 0)
-		return vec3(0);
+	//if(depth == 0)
+	//	return vec3(0);
 	//triangle tri(vec3(-1 , -1  , 0 ) , vec3(1 , -1  , 0 ) , vec3(0 , 1  , 0 ) );
 	
 
@@ -233,7 +270,8 @@ glm::vec3 traceRay(ray r  , vec3* vertices , ivec4* faces , int numOfFaces, int 
 	float t = 0.5 * (unitDirection.y + 1.0);
 	vec3 color;
 	float tmin = 0.01;
-	if(curIntersection.t != 1000 ) color = shaderSurface(curIntersection,  vertices , faces ,  numOfFaces , --depth);//vec3(1);
+	
+	if(curIntersection.t != 1000 ) color = shaderSurface(curIntersection,  vertices , faces ,  numOfFaces , --depth , carryRay);//vec3(1);
 	else
 	color =  glm::vec3(0.5 , 0.7 , 1.0) *  t;
 
@@ -241,8 +279,31 @@ glm::vec3 traceRay(ray r  , vec3* vertices , ivec4* faces , int numOfFaces, int 
 
 }
 
+__global__ void traceCarryForwardRays(rayCarryForward* carrayRays , unsigned char *ptr ,vec3* vertices , ivec4* faces , int numOfFaces , float time , rayCarryForward* carryForwardRays ){
+	 int x = threadIdx.x + blockIdx.x * blockDim.x;
+    //int y = threadIdx.y + blockIdx.y * blockDim.y;
 
-__global__ void kernel( unsigned char *ptr , vec3* vertices , ivec4* faces , int numOfFaces , float time ) {
+	//if(carrayRays->active == false )return;//thread dirvergence
+
+	
+	rayCarryForward carryRay = carrayRays[x];
+	int offset = carryRay.pixcleOffset;
+	rayCarryForward carryNext;
+	glm::vec3 color = traceRay(carryRay.carryRay  , vertices , faces , numOfFaces  ,2  ,carryNext);
+	carryForwardRays[x] = carryNext;
+	//color = vec3(1,0,0);
+	 ptr[offset*4 + 0] = (int)(color.r * 255);
+						//(255*(1+rayDirection.x)*0.5);
+						//1;
+    ptr[offset*4 + 1] = (int)(color.g * 255);
+						//(255*(1+rayDirection.y)*0.5);
+						//0;
+    ptr[offset*4 + 2] = (int)(color.b * 255);
+						//0;
+    ptr[offset*4 + 3] = 1;//255;
+}
+
+__global__ void kernel( unsigned char *ptr , vec3* vertices , ivec4* faces , int numOfFaces , float time , rayCarryForward* carryForwardRays) {
 
 	   int x = threadIdx.x + blockIdx.x * blockDim.x;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
@@ -262,10 +323,12 @@ __global__ void kernel( unsigned char *ptr , vec3* vertices , ivec4* faces , int
 	rayDirection = cam * rayDirection;
 
 	ray ra(rayOrigin , rayDirection);
-	glm::vec3 color = traceRay(ra  , vertices , faces , numOfFaces  ,2  );
+	rayCarryForward carryRay;
+	
+	carryRay.pixcleOffset = offset;
+	glm::vec3 color = traceRay(ra  , vertices , faces , numOfFaces  ,2  ,carryRay);
 
-	 
-
+	carryForwardRays[offset] = carryRay;
 	 ptr[offset*4 + 0] = (int)(color.r * 255);
 						//(255*(1+rayDirection.x)*0.5);
 						//1;
@@ -280,6 +343,8 @@ __global__ void kernel( unsigned char *ptr , vec3* vertices , ivec4* faces , int
 
 triangleMesh *devTriangleMesh;
 	triangleMesh* hostTriangleMesh;
+	rayCarryForward* devCarryRays;
+	rayCarryForward* hostCarryRays;
 void init(){
 
 	
@@ -322,30 +387,37 @@ void init(){
 
 
 	 const int isoFaces[] = {
-        2, 1, 0,        0,
-        3, 2, 0,		0,
-        4, 3, 0,		0,
-        5, 4, 0,		0,
-        1, 5, 0,		0,
-        11, 6,  7,		0,
-        11, 7,  8,		0,
-        11, 8,  9,		0,
-        11, 9,  10,		0,
-        11, 10, 6,		0,
-        1, 2, 6,		0,
-        2, 3, 7,		0,
-        3, 4, 8,		0,
-        4, 5, 9,		0,
-        5, 1, 10,		0,
-        2,  7, 6,		0,
-        3,  8, 7,		0,
-        4,  9, 8,		0,
-        5, 10, 9,		0,
-        1, 6, 10,		0,
+        2, 1, 0,        3,
+        3, 2, 0,		3,
+        4, 3, 0,		3,
+        5, 4, 0,		3,
+        1, 5, 0,		3,
+        11, 6,  7,		3,
+        11, 7,  8,		3,
+        11, 8,  9,		3,
+        11, 9,  10,		3,
+        11, 10, 6,		3,
+        1, 2, 6,		3,
+        2, 3, 7,		3,
+        3, 4, 8,		3,
+        4, 5, 9,		3,
+        5, 1, 10,		3,
+        2,  7, 6,		3,
+        3,  8, 7,		3,
+        4,  9, 8,		3,
+        5, 10, 9,		3,
+        1, 6, 10,		3,
 	   12 , 14, 13,		0,
 		13 ,  14 , 15,	0,
-		12 , 16 ,14,	2,
-		14 ,16 ,17,     2,   };
+		12 , 16 ,14,	0,
+		14 ,16 ,17,     0,  
+		18 , 19 , 13  , 0,
+		13 , 19,15	  ,0 ,
+		15 ,14 ,  17 , 0,
+		17 ,  19 , 15 ,0,
+
+	 
+	 };
 
     const float isoVerts[] = {
          0.000f,  0.000f,  1.000f,     //0 
@@ -360,24 +432,28 @@ void init(){
         -0.276f, -0.851f, -0.447f,	  
          0.724f, -0.526f, -0.447f,	  
          0.000f,  0.000f, -1.000f ,	  
-	   -2.00f , -1.000f ,  2.00f,      //12
-		2.00f , -1.000f ,  2.00f,	  
-	   -2.00f , -1.000f , -2.00f,	  
-		2.00f , -1.000f , -2.00f,      //15 
-									  
-		-2.00f , 1.000f ,  2.00f,      //16
-		-2.00f , 1.000f ,  -2.00f,          };//17
+	   -2.00f , -2.000f ,  2.00f,      //12
+		2.00f , -2.000f ,  2.00f,	  
+	   -2.00f , -2.000f , -2.00f,	  
+		2.00f , -2.000f , -2.00f,      //15 							  
+	   -2.00f ,  2.000f ,   2.00f,      //16
+	   -2.00f ,  2.000f ,  -2.00f,      //17
+		2.00f ,  2.000f ,   2.00f,   //18
+		2.00f ,  2.000f ,  -2.00f, //19
+	
+	};
 
 		 
 
-
-	cudaMalloc((void**)&devVec3 , sizeof(vec3)*18);
-	cudaMalloc((void**)&devFaces , sizeof(ivec4)*24);
-
+		 std::cout << sizeof(rayCarryForward) << endl;
+		 std::cout << sizeof(ray) + sizeof(int) + sizeof(int) << std::endl;
+	cudaMalloc((void**)&devVec3 , sizeof(vec3)*20);
+	cudaMalloc((void**)&devFaces , sizeof(ivec4)*28);
+	cudaMalloc((void**)&devCarryRays , sizeof(rayCarryForward) * DIM * DIM);
 	
-	cudaMemcpy( devVec3, isoVerts, sizeof(vec3)*18, cudaMemcpyHostToDevice );
-	cudaMemcpy( devFaces, isoFaces, sizeof(ivec4)*24, cudaMemcpyHostToDevice );
-	
+	cudaMemcpy( devVec3, isoVerts, sizeof(vec3)*20, cudaMemcpyHostToDevice );
+	cudaMemcpy( devFaces, isoFaces, sizeof(ivec4)*28, cudaMemcpyHostToDevice );
+	hostCarryRays = (rayCarryForward*) malloc( sizeof(rayCarryForward) * DIM * DIM);
 	//loadFishToDevise(devVec3 , devFaces);
 	//	 mesh* fish = new mesh();
 /*		 int numOfFishVert = 713;
@@ -407,7 +483,59 @@ void Draw()
 	  dim3    grids(DIM/16,DIM/16);
     dim3    threads(16,16);
 	float time = 0.0f;//glutGet(GLUT_ELAPSED_TIME)/1000;//0.0f;
-    kernel<<<grids,threads>>>( devPixels , devVec3 , devFaces , 24, time);
+    kernel<<<grids,threads>>>( devPixels , devVec3 , devFaces , 28, time , devCarryRays);
+		cudaMemcpy( hostCarryRays, devCarryRays, sizeof(rayCarryForward) * DIM * DIM, cudaMemcpyDeviceToHost );
+		vector<rayCarryForward> activeForwardRays;
+
+		for(int i = 0 ; i < WIDTH * HEIGHT ; i++){
+			if(hostCarryRays[i].rayType > 0)
+				activeForwardRays.push_back(hostCarryRays[i]);
+
+			//std::cout << hostCarryRays[i].rayType << std::endl;
+		}
+	
+	std::cout << activeForwardRays.size() <<std::endl;
+	rayCarryForward* devCarryRays2;
+	
+	cudaMalloc((void**)&devCarryRays2 , sizeof(rayCarryForward) * activeForwardRays.size());
+	cudaMemcpy(devCarryRays2 , activeForwardRays.data() , sizeof(rayCarryForward) * activeForwardRays.size() , cudaMemcpyHostToDevice);
+	
+		  dim3    grids1D(activeForwardRays.size() /16);
+    dim3    threads1D(16);
+	int depth = 3;
+
+	while(depth > 0 &&  activeForwardRays.size() > 0)
+	{
+		depth = depth - 1;
+	cudaFree(devCarryRays);
+	int rayCount = activeForwardRays.size();
+	cudaMalloc((void**)&devCarryRays , sizeof(rayCarryForward) * rayCount);
+	free(hostCarryRays);
+	hostCarryRays = (rayCarryForward*) malloc( sizeof(rayCarryForward) * rayCount);
+
+	traceCarryForwardRays<<<grids1D,threads1D>>>(devCarryRays2 ,devPixels , devVec3 , devFaces , 28, time , devCarryRays);
+	
+	
+	cudaMemcpy( hostCarryRays, devCarryRays, sizeof(rayCarryForward) * DIM * DIM, cudaMemcpyDeviceToHost );
+	
+	activeForwardRays.clear();
+
+		for(int i = 0 ; i < rayCount ; i++){
+			if(hostCarryRays[i].rayType > 0)
+				activeForwardRays.push_back(hostCarryRays[i]);
+
+			//std::cout << hostCarryRays[i].rayType << std::endl;
+		}
+	
+	
+	cudaFree(devCarryRays2);
+	cudaMalloc((void**)&devCarryRays2 , sizeof(rayCarryForward) * activeForwardRays.size());
+	cudaMemcpy(devCarryRays2 , activeForwardRays.data() , sizeof(rayCarryForward) * activeForwardRays.size() , cudaMemcpyHostToDevice);
+	
+	}
+
+
+
 	cudaMemcpy( pixels, devPixels, imageSize, cudaMemcpyDeviceToHost );
 	 glDrawPixels( WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, pixels );
 	 glutSwapBuffers();
